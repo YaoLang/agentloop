@@ -4,22 +4,33 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+)
+
+const (
+	defaultMaxRetries = 3
+	defaultBackoff    = 200 * time.Millisecond
+	maxBackoff        = 2 * time.Second
+	maxBodyBytes      = 4 << 20
 )
 
 // OpenAI is a thin OpenAI-compatible Chat Completions client.
 // Configure with OPENAI_BASE_URL (default https://api.openai.com/v1),
 // OPENAI_API_KEY, and optional OPENAI_MODEL (default gpt-4o-mini).
 type OpenAI struct {
-	BaseURL string
-	APIKey  string
-	Model   string
-	HTTP    *http.Client
+	BaseURL    string
+	APIKey     string
+	Model      string
+	HTTP       *http.Client
+	MaxRetries int           // default 3 (plus the first attempt)
+	Backoff    time.Duration // default 200ms; exponential, cap 2s
 }
 
 // FromEnv builds a client from the environment. Returns an error if
@@ -38,10 +49,12 @@ func FromEnv() (*OpenAI, error) {
 		name = "gpt-4o-mini"
 	}
 	return &OpenAI{
-		BaseURL: base,
-		APIKey:  key,
-		Model:   name,
-		HTTP:    &http.Client{Timeout: 60 * time.Second},
+		BaseURL:    base,
+		APIKey:     key,
+		Model:      name,
+		HTTP:       &http.Client{Timeout: 60 * time.Second},
+		MaxRetries: defaultMaxRetries,
+		Backoff:    defaultBackoff,
 	}, nil
 }
 
@@ -103,9 +116,19 @@ type oaiResp struct {
 }
 
 func (c *OpenAI) Complete(ctx context.Context, req CompleteRequest) (CompleteResponse, error) {
-	if c.HTTP == nil {
-		c.HTTP = &http.Client{Timeout: 60 * time.Second}
+	ht := c.HTTP
+	if ht == nil {
+		ht = &http.Client{Timeout: 60 * time.Second}
 	}
+	maxRetries := c.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = defaultMaxRetries
+	}
+	backoff := c.Backoff
+	if backoff <= 0 {
+		backoff = defaultBackoff
+	}
+
 	body := oaiReq{
 		Model:     c.Model,
 		Messages:  toOAI(req.Messages),
@@ -126,6 +149,34 @@ func (c *OpenAI) Complete(ctx context.Context, req CompleteRequest) (CompleteRes
 	if err != nil {
 		return CompleteResponse{}, err
 	}
+
+	start := time.Now()
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return CompleteResponse{}, err
+		}
+		resp, err := c.doOnce(ctx, ht, raw)
+		if err == nil {
+			resp.Latency = time.Since(start)
+			return resp, nil
+		}
+		lastErr = err
+		if !IsRetryable(err) || attempt == maxRetries {
+			return CompleteResponse{}, err
+		}
+		wait := retryWait(err, backoff, attempt)
+		if re, ok := lastErr.(*RetryableError); ok && re.After == 0 {
+			re.After = wait
+		}
+		if err := sleepCtx(ctx, wait); err != nil {
+			return CompleteResponse{}, err
+		}
+	}
+	return CompleteResponse{}, lastErr
+}
+
+func (c *OpenAI) doOnce(ctx context.Context, ht *http.Client, raw []byte) (CompleteResponse, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), bytes.NewReader(raw))
 	if err != nil {
 		return CompleteResponse{}, err
@@ -133,29 +184,56 @@ func (c *OpenAI) Complete(ctx context.Context, req CompleteRequest) (CompleteRes
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
 
-	start := time.Now()
-	httpResp, err := c.HTTP.Do(httpReq)
+	httpResp, err := ht.Do(httpReq)
 	if err != nil {
-		return CompleteResponse{}, err
+		if ctx.Err() != nil {
+			return CompleteResponse{}, ctx.Err()
+		}
+		// Do not wrap with %w: client timeouts are DeadlineExceeded but
+		// are still transport failures we retry. Parent ctx is returned above.
+		return CompleteResponse{}, &RetryableError{Err: fmt.Errorf("transport: %v", err)}
 	}
 	defer httpResp.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(httpResp.Body, 4<<20))
+	payload, err := io.ReadAll(io.LimitReader(httpResp.Body, maxBodyBytes))
 	if err != nil {
-		return CompleteResponse{}, err
+		if ctx.Err() != nil {
+			return CompleteResponse{}, ctx.Err()
+		}
+		return CompleteResponse{}, &RetryableError{Status: httpResp.StatusCode, Err: fmt.Errorf("transport: %v", err)}
 	}
+
+	status := httpResp.StatusCode
+	after := parseRetryAfter(httpResp.Header)
 	var parsed oaiResp
-	if err := json.Unmarshal(payload, &parsed); err != nil {
-		return CompleteResponse{}, fmt.Errorf("openai: decode: %w (status %d)", err, httpResp.StatusCode)
+	decErr := json.Unmarshal(payload, &parsed)
+
+	if retryableStatus(status) {
+		inner := fmt.Errorf("openai: HTTP %d: %s", status, truncate(string(payload), 400))
+		if decErr == nil && parsed.Error != nil {
+			inner = fmt.Errorf("openai: %s: %s", parsed.Error.Type, parsed.Error.Message)
+		} else if decErr != nil {
+			inner = fmt.Errorf("openai: decode: %w (status %d)", decErr, status)
+		}
+		return CompleteResponse{}, &RetryableError{Status: status, After: after, Err: inner}
+	}
+
+	if decErr != nil {
+		err := fmt.Errorf("openai: decode: %w (status %d)", decErr, status)
+		if status >= 200 && status < 300 {
+			return CompleteResponse{}, &RetryableError{Status: status, Err: err}
+		}
+		return CompleteResponse{}, err
 	}
 	if parsed.Error != nil {
 		return CompleteResponse{}, fmt.Errorf("openai: %s: %s", parsed.Error.Type, parsed.Error.Message)
 	}
-	if httpResp.StatusCode >= 300 {
-		return CompleteResponse{}, fmt.Errorf("openai: HTTP %d: %s", httpResp.StatusCode, truncate(string(payload), 400))
+	if status >= 300 {
+		return CompleteResponse{}, fmt.Errorf("openai: HTTP %d: %s", status, truncate(string(payload), 400))
 	}
 	if len(parsed.Choices) == 0 {
-		return CompleteResponse{}, fmt.Errorf("openai: empty choices")
+		return CompleteResponse{}, &RetryableError{Status: status, Err: fmt.Errorf("openai: empty choices")}
 	}
+
 	ch := parsed.Choices[0]
 	msg := Message{
 		Role:       nz(ch.Message.Role, "assistant"),
@@ -176,10 +254,69 @@ func (c *OpenAI) Complete(ctx context.Context, req CompleteRequest) (CompleteRes
 	return CompleteResponse{
 		Message:      msg,
 		Usage:        parsed.Usage,
-		Latency:      time.Since(start),
 		Model:        nz(parsed.Model, c.Model),
 		FinishReason: ch.FinishReason,
 	}, nil
+}
+
+func retryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseRetryAfter(h http.Header) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	sec, err := strconv.Atoi(v)
+	if err != nil || sec < 0 {
+		return 0
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func retryWait(err error, base time.Duration, attempt int) time.Duration {
+	var re *RetryableError
+	if errors.As(err, &re) && re.After > 0 {
+		return re.After
+	}
+	return expBackoff(base, attempt, maxBackoff)
+}
+
+func expBackoff(base time.Duration, attempt int, cap time.Duration) time.Duration {
+	if base <= 0 {
+		base = defaultBackoff
+	}
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt > 20 {
+		return cap
+	}
+	d := base * time.Duration(1<<uint(attempt))
+	if d > cap || d < 0 {
+		return cap
+	}
+	return d
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func toOAI(in []Message) []oaiMsg {

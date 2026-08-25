@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/YaoLang/agentloop/internal/memory"
@@ -25,19 +26,24 @@ import (
 	"github.com/YaoLang/agentloop/internal/trace"
 )
 
+// errEmptyAssistant is returned by completeWithRetry after one empty retry.
+var errEmptyAssistant = errors.New("empty assistant message")
+
 // Config is one run.
 type Config struct {
-	Workspace   string
-	Goal        string
-	Model       model.Model
-	Registry    *tools.Registry
-	Memory      *memory.Store
-	MaxSteps    int
-	MaxTokens   int
-	MaxCostUSD  float64
-	Timeout     time.Duration
-	ToolTimeout time.Duration
-	RunID       string
+	Workspace      string
+	Goal           string
+	Model          model.Model
+	Registry       *tools.Registry
+	Memory         *memory.Store
+	MaxSteps       int
+	MaxTokens      int
+	MaxCostUSD     float64
+	Timeout        time.Duration
+	ToolTimeout    time.Duration
+	RunID          string
+	ModelRetries   int           // default 3
+	ModelRetryWait time.Duration // default 50ms (tests stay fast)
 }
 
 // Result is the outcome of a loop.
@@ -53,6 +59,7 @@ type Result struct {
 	JailHits   int
 	Timeouts   int
 	SchemaErrs int
+	Panics     int
 	Session    *session.Session
 }
 
@@ -72,6 +79,12 @@ func Defaults(cfg *Config) {
 	}
 	if cfg.ToolTimeout <= 0 {
 		cfg.ToolTimeout = 5 * time.Second
+	}
+	if cfg.ModelRetries <= 0 {
+		cfg.ModelRetries = 3
+	}
+	if cfg.ModelRetryWait <= 0 {
+		cfg.ModelRetryWait = 50 * time.Millisecond
 	}
 	if cfg.RunID == "" {
 		cfg.RunID = newID()
@@ -141,12 +154,22 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 			break
 		}
 
-		resp, err := cfg.Model.Complete(ctx, model.CompleteRequest{
+		req := model.CompleteRequest{
 			Messages: sess.Messages,
 			Tools:    specs,
-		})
+		}
+		resp, err := completeWithRetry(ctx, cfg, tw, step, req)
+		if errors.Is(err, errEmptyAssistant) {
+			out.Steps = step
+			out.StopReason = "model_empty"
+			out.Final = "stopped: model_empty"
+			out.Latency = time.Since(start)
+			_ = finish(tw, sess, out)
+			return out, nil
+		}
 		if err != nil {
 			out.StopReason = "model_error"
+			out.Final = err.Error()
 			out.Latency = time.Since(start)
 			_ = finish(tw, sess, out)
 			return out, err
@@ -192,24 +215,30 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 			if err := cfg.Registry.Validate(tc.Name, tc.Arguments); err != nil {
 				tr.Error = err.Error()
 				tr.SchemaErr = true
-				tr.Result = "schema/policy error: " + err.Error()
+				tr.Result = "error:schema: " + err.Error()
 				out.SchemaErrs++
 			} else {
-				obs, callErr := cfg.Registry.Call(ctx, tc.Name, tc.Arguments)
-				tr.Result = obs
+				obs, callErr := safeCall(ctx, cfg.Registry, tc.Name, tc.Arguments)
 				if callErr != nil {
+					tagged, jail, timeout, isPanic := classifyToolErr(callErr)
 					tr.Error = callErr.Error()
-					if errors.Is(callErr, sandbox.ErrPathEscape) || errors.Is(callErr, sandbox.ErrDeniedBin) {
-						tr.Jail = true
+					tr.Result = tagged
+					if obs != "" {
+						tr.Result = tagged + "\n" + obs
+					}
+					tr.Jail = jail
+					tr.Timeout = timeout
+					if jail {
 						out.JailHits++
 					}
-					if errors.Is(callErr, sandbox.ErrTimeout) || errors.Is(callErr, context.DeadlineExceeded) {
-						tr.Timeout = true
+					if timeout {
 						out.Timeouts++
 					}
-				}
-				if tr.Result == "" && callErr != nil {
-					tr.Result = "error: " + callErr.Error()
+					if isPanic {
+						out.Panics++
+					}
+				} else {
+					tr.Result = obs
 				}
 			}
 			tr.Latency = time.Since(t0)
@@ -255,6 +284,112 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	out.Latency = time.Since(start)
 	_ = finish(tw, sess, out)
 	return out, nil
+}
+
+func completeWithRetry(ctx context.Context, cfg Config, tw *trace.Writer, step int, req model.CompleteRequest) (model.CompleteResponse, error) {
+	maxRetries := cfg.ModelRetries
+	wait0 := cfg.ModelRetryWait
+	var lastErr error
+	emptyTried := false
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return model.CompleteResponse{}, lastErr
+			}
+			return model.CompleteResponse{}, err
+		}
+		resp, err := cfg.Model.Complete(ctx, req)
+		if err == nil {
+			if !emptyAssistant(resp.Message) {
+				return resp, nil
+			}
+			err = &model.RetryableError{Err: errEmptyAssistant}
+			if emptyTried {
+				return resp, errEmptyAssistant
+			}
+			emptyTried = true
+		}
+		lastErr = err
+		if !model.IsRetryable(err) || attempt >= maxRetries {
+			return model.CompleteResponse{}, err
+		}
+		wait := expBackoff(wait0, attempt, time.Second)
+		_ = tw.Log(trace.Event{
+			Type:  "model_retry",
+			RunID: cfg.RunID,
+			Step:  step,
+			Error: err.Error(),
+		})
+		if err := sleepCtx(ctx, wait); err != nil {
+			return model.CompleteResponse{}, err
+		}
+	}
+	if lastErr != nil {
+		return model.CompleteResponse{}, lastErr
+	}
+	return model.CompleteResponse{}, errEmptyAssistant
+}
+
+func emptyAssistant(m model.Message) bool {
+	return len(m.ToolCalls) == 0 && strings.TrimSpace(m.Content) == ""
+}
+
+func safeCall(ctx context.Context, reg *tools.Registry, name, args string) (obs string, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			obs = ""
+			err = fmt.Errorf("tool panic: %v", rec)
+		}
+	}()
+	return reg.Call(ctx, name, args)
+}
+
+func classifyToolErr(err error) (obs string, jail, timeout, isPanic bool) {
+	if err == nil {
+		return "", false, false, false
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "panic"):
+		return "error:panic: " + msg, false, false, true
+	case errors.Is(err, sandbox.ErrPathEscape), errors.Is(err, sandbox.ErrDeniedBin):
+		return "error:jail: " + msg, true, false, false
+	case errors.Is(err, sandbox.ErrTimeout), errors.Is(err, context.DeadlineExceeded):
+		return "error:timeout: " + msg, false, true, false
+	default:
+		return "error:tool: " + msg, false, false, false
+	}
+}
+
+func expBackoff(base time.Duration, attempt int, cap time.Duration) time.Duration {
+	if base <= 0 {
+		base = 50 * time.Millisecond
+	}
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt > 20 {
+		return cap
+	}
+	d := base * time.Duration(1<<uint(attempt))
+	if d > cap || d < 0 {
+		return cap
+	}
+	return d
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func finish(tw *trace.Writer, sess *session.Session, out *Result) error {

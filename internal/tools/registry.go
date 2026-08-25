@@ -109,8 +109,12 @@ func (r *Registry) Validate(name, argsJSON string) error {
 }
 
 // Call validates and runs a tool with its timeout.
-func (r *Registry) Call(ctx context.Context, name, argsJSON string) (string, error) {
-	if err := r.Validate(name, argsJSON); err != nil {
+// Handler panics are recovered so a buggy tool cannot crash the process.
+func (r *Registry) Call(ctx context.Context, name, argsJSON string) (obs string, err error) {
+	if err = ctx.Err(); err != nil {
+		return "", err
+	}
+	if err = r.Validate(name, argsJSON); err != nil {
 		return "", err
 	}
 	r.mu.RLock()
@@ -121,5 +125,11 @@ func (r *Registry) Call(ctx context.Context, name, argsJSON string) (string, err
 		ctx, cancel = context.WithTimeout(ctx, t.Timeout)
 		defer cancel()
 	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			obs = ""
+			err = fmt.Errorf("tool panic: %v", rec)
+		}
+	}()
 	return t.Handler(ctx, argsJSON)
 }

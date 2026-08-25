@@ -75,7 +75,7 @@ go run ./cmd/agentloop replay --trace /tmp/al/.agentloop/traces/<run-id>.jsonl
 
 ## Architecture
 
-The loop is deliberately small. There is no chain framework, no prompt graph, no hidden retries.
+The loop is deliberately small. There is no chain framework and no prompt graph.
 
 1. Load workspace, memory store, tool registry, JSONL writer.
 2. Append the user goal.
@@ -85,6 +85,8 @@ The loop is deliberately small. There is no chain framework, no prompt graph, no
    - Else validate each call (name, allow/deny, JSON schema) and execute it inside the jail.
    - Append the observation as a `tool` message and continue.
 4. Persist `session.json` and the trace.
+
+**Stability.** Model retries on 429/5xx; tool panics isolated; observations tagged `error:schema|jail|timeout|panic|tool`.
 
 Workspace layout after a run:
 

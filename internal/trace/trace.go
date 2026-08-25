@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Event is one JSONL line. Type is model_call | tool_call | budget | final.
+// Event is one JSONL line. Type is model_call | model_retry | tool_call | budget | final.
 type Event struct {
 	TS         time.Time      `json:"ts"`
 	Type       string         `json:"type"`

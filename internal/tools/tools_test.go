@@ -141,3 +141,41 @@ func TestValidateArgsTable(t *testing.T) {
 		}
 	}
 }
+
+func TestCallRecoversPanic(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(&Tool{
+		Name: "boom",
+		Handler: func(ctx context.Context, argsJSON string) (string, error) {
+			panic("kaboom")
+		},
+	})
+	obs, err := reg.Call(context.Background(), "boom", `{}`)
+	if err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("obs=%q err=%v", obs, err)
+	}
+	if obs != "" {
+		t.Fatalf("observation should be empty on panic, got %q", obs)
+	}
+}
+
+func TestCallCanceledContext(t *testing.T) {
+	reg := NewRegistry()
+	called := false
+	reg.Register(&Tool{
+		Name: "x",
+		Handler: func(ctx context.Context, argsJSON string) (string, error) {
+			called = true
+			return "ok", nil
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := reg.Call(ctx, "x", `{}`)
+	if err == nil {
+		t.Fatal("expected ctx error")
+	}
+	if called {
+		t.Fatal("handler must not run when ctx is already done")
+	}
+}

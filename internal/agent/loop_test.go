@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -167,5 +168,121 @@ func TestDeniedTool(t *testing.T) {
 	}
 	if res.SchemaErrs == 0 {
 		t.Fatal("expected deny to surface as schema/policy error")
+	}
+}
+
+type flakyModel struct {
+	calls int
+}
+
+func (m *flakyModel) Name() string { return "flaky" }
+
+func (m *flakyModel) Complete(_ context.Context, _ model.CompleteRequest) (model.CompleteResponse, error) {
+	m.calls++
+	if m.calls <= 2 {
+		return model.CompleteResponse{}, &model.RetryableError{Status: 503, Err: fmt.Errorf("flaky 503")}
+	}
+	return model.CompleteResponse{
+		Message: model.Message{Role: "assistant", Content: "recovered"},
+		Model:   m.Name(),
+	}, nil
+}
+
+func TestLoopRetriesRetryableModelError(t *testing.T) {
+	ws := t.TempDir()
+	m := &flakyModel{}
+	res, err := Run(context.Background(), Config{
+		Workspace:      ws,
+		Goal:           "retry me",
+		Model:          m,
+		MaxSteps:       4,
+		ModelRetryWait: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StopReason != "completed" {
+		t.Fatalf("stop=%s final=%s", res.StopReason, res.Final)
+	}
+	if res.Final != "recovered" {
+		t.Fatalf("final=%q", res.Final)
+	}
+	if m.calls != 3 {
+		t.Fatalf("Complete called %d times, want 3", m.calls)
+	}
+}
+
+type stickyErrModel struct {
+	calls int
+	err   error
+}
+
+func (m *stickyErrModel) Name() string { return "sticky" }
+
+func (m *stickyErrModel) Complete(_ context.Context, _ model.CompleteRequest) (model.CompleteResponse, error) {
+	m.calls++
+	return model.CompleteResponse{}, m.err
+}
+
+func TestLoopPermanentModelError(t *testing.T) {
+	ws := t.TempDir()
+	m := &stickyErrModel{err: fmt.Errorf("openai: HTTP 400: bad request")}
+	res, err := Run(context.Background(), Config{
+		Workspace:      ws,
+		Goal:           "fail",
+		Model:          m,
+		MaxSteps:       4,
+		ModelRetryWait: time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if res == nil || res.StopReason != "model_error" {
+		t.Fatalf("stop=%v err=%v", res, err)
+	}
+	if m.calls != 1 {
+		t.Fatalf("Complete called %d times, want 1", m.calls)
+	}
+	if !strings.Contains(res.Final, "400") {
+		t.Fatalf("final should include error, got %q", res.Final)
+	}
+}
+
+func TestLoopToolPanicContinues(t *testing.T) {
+	ws := t.TempDir()
+	reg := tools.Default(tools.Options{Workspace: ws, ToolTimeout: time.Second})
+	reg.Register(&tools.Tool{
+		Name:        "boom",
+		Description: "panics",
+		Schema:      map[string]any{"type": "object"},
+		Handler: func(ctx context.Context, argsJSON string) (string, error) {
+			panic("kaboom")
+		},
+	})
+	m := model.NewScripted([]model.Step{
+		{Tool: "boom", Args: map[string]any{}},
+		{Content: "survived the boom"},
+	})
+	res, err := Run(context.Background(), Config{
+		Workspace: ws,
+		Goal:      "survive panic",
+		Model:     m,
+		Registry:  reg,
+		MaxSteps:  4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StopReason != "completed" {
+		t.Fatalf("stop=%s final=%s", res.StopReason, res.Final)
+	}
+	if res.Panics < 1 {
+		t.Fatalf("Panics=%d log=%+v", res.Panics, res.ToolLog)
+	}
+	if res.Final != "survived the boom" {
+		t.Fatalf("final=%q", res.Final)
+	}
+	if len(res.ToolLog) == 0 || !strings.Contains(res.ToolLog[0].Result, "error:panic:") {
+		t.Fatalf("expected panic observation, log=%+v", res.ToolLog)
 	}
 }
