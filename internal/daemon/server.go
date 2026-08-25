@@ -36,17 +36,21 @@ type Config struct {
 	JWTSecret     string
 	Auth          auth.Chain
 	NewModel      func(name string) (model.Model, error)
+	// ExtraTools, if set, is called when a run's registry is built.
+	// Returned tools are registered after builtins (Options.Extra).
+	ExtraTools func(opt tools.Options) []*tools.Tool
 }
 
 // Server is the HTTP API.
 type Server struct {
-	cfg    Config
-	store  *Store
-	keys   *auth.FileKeyStore
-	auth   auth.Chain
-	mux    *http.ServeMux
-	quota  *quota
-	newMod func(name string) (model.Model, error)
+	cfg     Config
+	store   *Store
+	keys    *auth.FileKeyStore
+	secrets *SecretStore
+	auth    auth.Chain
+	mux     *http.ServeMux
+	quota   *quota
+	newMod  func(name string) (model.Model, error)
 }
 
 type quota struct {
@@ -119,14 +123,19 @@ func New(cfg Config) (*Server, error) {
 	if newMod == nil {
 		newMod = defaultNewModel
 	}
+	sec, err := newSecretStore(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
-		cfg:    cfg,
-		store:  st,
-		keys:   ks,
-		auth:   chain,
-		mux:    http.NewServeMux(),
-		quota:  &quota{running: map[string]int{}, limit: cfg.MaxConcurrent},
-		newMod: newMod,
+		cfg:     cfg,
+		store:   st,
+		keys:    ks,
+		secrets: sec,
+		auth:    chain,
+		mux:     http.NewServeMux(),
+		quota:   &quota{running: map[string]int{}, limit: cfg.MaxConcurrent},
+		newMod:  newMod,
 	}
 	s.routes()
 	return s, nil
@@ -151,6 +160,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/admin/tenants", s.withAuth(s.requireScope(auth.ScopeAdmin, s.handleCreateTenant)))
 	s.mux.HandleFunc("GET /v1/admin/tenants", s.withAuth(s.requireScope(auth.ScopeAdmin, s.handleListTenants)))
 	s.mux.HandleFunc("POST /v1/admin/keys", s.withAuth(s.requireScope(auth.ScopeAdmin, s.handleMintKey)))
+	s.mux.HandleFunc("PUT /v1/admin/tenants/{id}/secrets", s.withAuth(s.requireScope(auth.ScopeAdmin, s.handlePutSecret)))
+	s.mux.HandleFunc("GET /v1/admin/tenants/{id}/secrets", s.withAuth(s.requireScope(auth.ScopeAdmin, s.handleListSecrets)))
+	s.mux.HandleFunc("DELETE /v1/admin/tenants/{id}/secrets/{name}", s.withAuth(s.requireScope(auth.ScopeAdmin, s.handleDeleteSecret)))
 }
 
 // ServeHTTP implements http.Handler.
@@ -262,6 +274,64 @@ func (s *Server) handleMintKey(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type putSecretReq struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+func (s *Server) handlePutSecret(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.store.getTenant(id); err != nil {
+		writeErr(w, http.StatusNotFound, "not_found", "tenant not found")
+		return
+	}
+	var req putSecretReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if err := s.secrets.Put(id, req.Name, req.Value); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"name": req.Name})
+}
+
+func (s *Server) handleListSecrets(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.store.getTenant(id); err != nil {
+		writeErr(w, http.StatusNotFound, "not_found", "tenant not found")
+		return
+	}
+	names, err := s.secrets.ListNames(id)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if names == nil {
+		names = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"names": names})
+}
+
+func (s *Server) handleDeleteSecret(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	name := r.PathValue("name")
+	if _, err := s.store.getTenant(id); err != nil {
+		writeErr(w, http.StatusNotFound, "not_found", "tenant not found")
+		return
+	}
+	if err := s.secrets.Delete(id, name); err != nil {
+		if errors.Is(err, errNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "secret not found")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 type createRunReq struct {
 	Goal  string `json:"goal"`
 	Model string `json:"model"`
@@ -310,11 +380,11 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.appendEvent(rec.TenantID, rec.ID, Event{Type: "status", Status: statusQueued}); err != nil {
 		log.Printf("agentloopd: event write tenant=%s run=%s: %v", rec.TenantID, rec.ID, err)
 	}
-	go s.executeRun(rec)
+	go s.executeRun(rec, p)
 	writeJSON(w, http.StatusAccepted, map[string]any{"id": rec.ID, "status": rec.Status})
 }
 
-func (s *Server) executeRun(rec RunRecord) {
+func (s *Server) executeRun(rec RunRecord, p auth.Principal) {
 	defer s.quota.release(rec.TenantID)
 	defer func() {
 		if x := recover(); x != nil {
@@ -353,13 +423,31 @@ func (s *Server) executeRun(rec RunRecord) {
 		_ = s.store.putRun(rec)
 		return
 	}
-	reg := tools.Default(tools.Options{
+	opt := tools.Options{
 		Workspace:   ws,
 		Memory:      mem,
 		ToolTimeout: s.cfg.ToolTimeout,
-	})
+	}
+	if s.cfg.ExtraTools != nil {
+		opt.Extra = s.cfg.ExtraTools(opt)
+	}
+	reg := tools.Default(opt)
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.RunTimeout)
 	defer cancel()
+	ctx = auth.WithPrincipal(ctx, p)
+	tenantID := p.TenantID
+	secrets := s.secrets
+	ctx = tools.WithRuntime(ctx, tools.Runtime{
+		TenantID: p.TenantID,
+		Subject:  p.Subject,
+		Scopes:   append([]string(nil), p.Scopes...),
+		Secret: func(name string) (string, bool) {
+			if secrets == nil {
+				return "", false
+			}
+			return secrets.Get(tenantID, name)
+		},
+	})
 	res, err := agent.Run(ctx, agent.Config{
 		Workspace:   ws,
 		Goal:        rec.Goal,

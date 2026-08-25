@@ -16,7 +16,7 @@ This repository is **original open-source work** by [Yaolang Kong](https://githu
 | --- | --- |
 | Loop | `model → tool calls → observe → continue`, with max steps, wall-clock timeout, token and cost budgets |
 | Model | `Model` interface. **Mock** (deterministic, no network) for tests/demo. **OpenAI-compatible** HTTP client via `OPENAI_BASE_URL` + `OPENAI_API_KEY` |
-| Tools | `exec` (sandboxed), `read_file`, `write_file` (workspace-scoped), `memory_write`, `memory_read` (session + append-only long-term notes) |
+| Tools | `exec` (sandboxed), `read_file`, `write_file` (workspace-scoped), `memory_write`, `memory_read`, `whoami`. Custom tools via `Options.Extra` / `Config.ExtraTools`. |
 | Sandbox | Process jail. Path confinement. Binary allow-list. Timeouts. Stdout/stderr caps. **No Docker.** Tests prove jail + timeout. |
 | Eval | JSONL suite, deterministic scorers (success / schema / jail / timeout / latency / steps). LLM-as-judge is **opt-in, default OFF** so CI is hermetic. |
 | Trace | One JSONL file per run: model call, tool call, tokens, latency, cost |
@@ -178,9 +178,10 @@ JWT (HS256) is the other built-in plugin. Claims: `sub`, `tid`, `scp`. Sign with
 
 ### Isolation
 
-- On-disk: `data/tenants/{id}/workspace`, `…/runs/{runID}/`, `data/keys.json`.
+- On-disk: `data/tenants/{id}/workspace`, `…/runs/{runID}/`, `data/tenants/{id}/secrets.json` (mode 0600), `data/keys.json`.
 - A run is loaded only from the **caller’s** tenant directory. Tenant B fetching tenant A’s run id gets **404** (never the contents).
 - Tools are jailed to that workspace (`JailPath`, binary allow-list, timeouts). Tenant A writing `agent-notes.txt` does not appear in tenant B’s workspace; an absolute path into A is a jail miss.
+- Per-tenant secrets are in-process only (`Runtime.Secret`). They are **never** injected into the exec jail env (`echo $TOKEN` cannot see them), never listed by value on the admin API, and never printed by `whoami`.
 - Per-tenant concurrency default 8; over the cap → **429**.
 - 401 missing/invalid credentials; 403 wrong scope (e.g. a tenant key hitting `/v1/admin/*`).
 
@@ -195,6 +196,83 @@ type Authenticator interface {
 
 Implement the interface (skip when your credential type is missing; return `ErrUnauthorized` when it is present but invalid). Insert it into the chain in `daemon.New` — first non-skip success wins. Do not log raw keys.
 
+### Extending tools
+
+Custom tools see the authenticated tenant **without** leaking secrets to the model or the exec jail.
+
+Register extras after the builtins:
+
+- `tools.Options.Extra` — `tools.Default` registers exec / files / memory / `whoami`, then Extra (last `Register` wins).
+- `daemon.Config.ExtraTools func(opt tools.Options) []*tools.Tool` — called per run; the slice is assigned to `opt.Extra`.
+
+Read identity from the run context (Go handlers only — this is not advertised as tool args):
+
+```go
+rt, ok := tools.RuntimeFrom(ctx)
+p, ok := auth.PrincipalFrom(ctx)
+```
+
+`whoami` prints `tenant_id`, `subject`, and `scopes`. Without a Runtime (CLI) it returns `{"tenant_id":"local"}`. It never prints secrets.
+
+Read secrets for outbound HTTP with `rt.Secret("github")`. Missing → `ok=false`. **Never** print the value in the observation. **Never** copy it into `sandbox` / `exec` env — the jail inherits PATH only; `echo $TOKEN` and `printenv` must not see tenant secrets.
+
+Admin API (scope `admin`):
+
+```bash
+# set (body is {name, value}; list never returns values)
+curl -sS -X PUT localhost:8080/v1/admin/tenants/acme/secrets \
+  -H "Authorization: Bearer $AGENTLOOP_ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"github","value":"gho_…"}'
+
+curl -sS localhost:8080/v1/admin/tenants/acme/secrets \
+  -H "Authorization: Bearer $AGENTLOOP_ADMIN_KEY"
+# {"names":["github"]}
+
+curl -sS -X DELETE localhost:8080/v1/admin/tenants/acme/secrets/github \
+  -H "Authorization: Bearer $AGENTLOOP_ADMIN_KEY"
+```
+
+Example handler (README only — there is no live GitHub tool in the binary):
+
+```go
+func githubWhoamiTool() *tools.Tool {
+    return &tools.Tool{
+        Name:        "github_whoami",
+        Description: "GET https://api.github.com/user using the tenant github secret. Never prints the token.",
+        Schema: map[string]any{
+            "type":       "object",
+            "properties": map[string]any{},
+        },
+        Handler: func(ctx context.Context, _ string) (string, error) {
+            rt, ok := tools.RuntimeFrom(ctx)
+            if !ok {
+                return "", fmt.Errorf("no runtime")
+            }
+            token, ok := rt.Secret("github")
+            if !ok {
+                return "github secret not configured", nil
+            }
+            req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user", nil)
+            if err != nil {
+                return "", err
+            }
+            req.Header.Set("Authorization", "Bearer "+token)
+            req.Header.Set("User-Agent", "agentloop")
+            res, err := http.DefaultClient.Do(req)
+            if err != nil {
+                return "", err
+            }
+            defer res.Body.Close()
+            body, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+            return string(body), nil
+        },
+    }
+}
+```
+
+Wire it with `Config.ExtraTools` returning `[]*tools.Tool{githubWhoamiTool()}`. Put the token via `PUT /v1/admin/tenants/{id}/secrets`. The model only sees the GitHub API body, never `gho_…`.
+
 ---
 
 ## Layout
@@ -204,9 +282,9 @@ cmd/agentloop/          CLI
 cmd/agentloopd/         multi-tenant HTTP daemon
 internal/agent/         the loop + budgets
 internal/auth/          pluggable Authenticator chain (API key, JWT, admin)
-internal/daemon/        HTTP API, tenant store, quota
+internal/daemon/        HTTP API, tenant store, quota, per-tenant secrets
 internal/model/         Model interface, mock, OpenAI client
-internal/tools/         registry, schema, builtins
+internal/tools/         registry, schema, builtins, Runtime
 internal/sandbox/       process jail
 internal/memory/        session + long-term notes
 internal/session/       messages + tool traces

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -159,6 +160,10 @@ func Run(ctx context.Context, argv []string, lim Limits) (Result, error) {
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = ws
+	// Minimal env: PATH for allow-listed binaries only. Do not inherit
+	// the daemon process environment (ADMIN_KEY, JWT, OPENAI_API_KEY,
+	// tenant secrets). `echo $TOKEN` / printenv must not see them.
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
 
 	var stdout, stderr bytes.Buffer
 	outW := &capWriter{buf: &stdout, n: lim.MaxOutput}

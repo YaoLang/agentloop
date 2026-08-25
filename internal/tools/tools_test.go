@@ -179,3 +179,166 @@ func TestCallCanceledContext(t *testing.T) {
 		t.Fatal("handler must not run when ctx is already done")
 	}
 }
+
+func TestWhoamiLocalWithoutRuntime(t *testing.T) {
+	reg, _, _ := setup(t)
+	out, err := reg.Call(context.Background(), "whoami", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "local") {
+		t.Fatalf("want tenant=local, out=%q", out)
+	}
+}
+
+func TestWhoamiWithRuntime(t *testing.T) {
+	reg, _, _ := setup(t)
+	const secret = "gho_must_not_appear"
+	ctx := WithRuntime(context.Background(), Runtime{
+		TenantID: "acme",
+		Subject:  "user-1",
+		Scopes:   []string{"runs:write", "admin"},
+		Secret: func(name string) (string, bool) {
+			if name == "github" {
+				return secret, true
+			}
+			return "", false
+		},
+	})
+	out, err := reg.Call(ctx, "whoami", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `"tenant_id":"acme"`) {
+		t.Fatalf("tenant missing: %s", out)
+	}
+	if !strings.Contains(out, `"subject":"user-1"`) {
+		t.Fatalf("subject missing: %s", out)
+	}
+	if !strings.Contains(out, "runs:write") {
+		t.Fatalf("scopes missing: %s", out)
+	}
+	if strings.Contains(out, secret) || strings.Contains(out, "github") {
+		t.Fatalf("whoami must not mention secrets, out=%q", out)
+	}
+}
+
+func TestExtraToolsRegistered(t *testing.T) {
+	ws := t.TempDir()
+	mem, err := memory.Open(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := Default(Options{
+		Workspace: ws,
+		Memory:    mem,
+		Extra: []*Tool{{
+			Name: "ping",
+			Handler: func(ctx context.Context, argsJSON string) (string, error) {
+				return "pong", nil
+			},
+		}},
+	})
+	if _, ok := reg.Get("ping"); !ok {
+		t.Fatal("extra tool not registered")
+	}
+	var names []string
+	for _, spec := range reg.Specs() {
+		names = append(names, spec.Name)
+	}
+	joined := strings.Join(names, ",")
+	if !strings.Contains(joined, "ping") {
+		t.Fatalf("extra tool not advertised: %v", names)
+	}
+	out, err := reg.Call(context.Background(), "ping", `{}`)
+	if err != nil || out != "pong" {
+		t.Fatalf("call ping: out=%q err=%v", out, err)
+	}
+}
+
+func TestHasSecretPresentAbsentNeverLeaksValue(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(HasSecretTool())
+	const secret = "gho_xxx_super_secret"
+	ctxA := WithRuntime(context.Background(), Runtime{
+		TenantID: "alpha",
+		Secret: func(name string) (string, bool) {
+			if name == "github" {
+				return secret, true
+			}
+			return "", false
+		},
+	})
+	out, err := reg.Call(ctxA, "has_secret", `{"name":"github"}`)
+	if err != nil || out != "present" {
+		t.Fatalf("alpha github: out=%q err=%v", out, err)
+	}
+	if strings.Contains(out, secret) {
+		t.Fatal("secret value leaked in observation")
+	}
+	out, err = reg.Call(ctxA, "has_secret", `{"name":"missing"}`)
+	if err != nil || out != "absent" {
+		t.Fatalf("alpha missing: out=%q err=%v", out, err)
+	}
+	ctxB := WithRuntime(context.Background(), Runtime{
+		TenantID: "beta",
+		Secret: func(name string) (string, bool) {
+			return "", false
+		},
+	})
+	out, err = reg.Call(ctxB, "has_secret", `{"name":"github"}`)
+	if err != nil || out != "absent" {
+		t.Fatalf("beta github: out=%q err=%v", out, err)
+	}
+	out, err = reg.Call(context.Background(), "has_secret", `{"name":"github"}`)
+	if err != nil || out != "absent" {
+		t.Fatalf("no runtime: out=%q err=%v", out, err)
+	}
+}
+
+func TestNilSecretLookupIsAbsent(t *testing.T) {
+	ctx := WithRuntime(context.Background(), Runtime{TenantID: "acme"})
+	rt, ok := RuntimeFrom(ctx)
+	if !ok {
+		t.Fatal("missing runtime")
+	}
+	_, present := rt.Secret("github")
+	if present {
+		t.Fatal("nil Secret should look up as absent")
+	}
+}
+
+func TestExecJailDoesNotSeeRuntimeSecrets(t *testing.T) {
+	ws := t.TempDir()
+	mem, err := memory.Open(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allow := append(append([]string{}, sandbox.DefaultAllow...), "printenv")
+	reg := Default(Options{Workspace: ws, Memory: mem, ToolTimeout: time.Second, AllowBins: allow})
+	const secret = "gho_jail_must_not_see"
+	ctx := WithRuntime(context.Background(), Runtime{
+		TenantID: "acme",
+		Secret: func(name string) (string, bool) {
+			if name == "github" || name == "TOKEN" {
+				return secret, true
+			}
+			return "", false
+		},
+	})
+	out, err := reg.Call(ctx, "exec", `{"command":["printenv","TOKEN"]}`)
+	if strings.Contains(out, secret) || (err != nil && strings.Contains(err.Error(), secret)) {
+		t.Fatalf("TOKEN leaked into jail: out=%s err=%v", out, err)
+	}
+	out, err = reg.Call(ctx, "exec", `{"command":["printenv","github"]}`)
+	if strings.Contains(out, secret) || (err != nil && strings.Contains(err.Error(), secret)) {
+		t.Fatalf("github leaked into jail: out=%s err=%v", out, err)
+	}
+	out, err = reg.Call(ctx, "exec", `{"command":["echo","hi"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, secret) {
+		t.Fatalf("secret leaked into echo observation: %s", out)
+	}
+}

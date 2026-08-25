@@ -21,9 +21,12 @@ type Options struct {
 	MaxOutput   int
 	AllowBins   []string
 	DenyBins    []string
+	// Extra tools are registered after the builtins (last Register wins).
+	Extra []*Tool
 }
 
-// Default registers exec, read_file, write_file, memory_write, memory_read.
+// Default registers exec, read_file, write_file, memory_write, memory_read,
+// whoami, then Extra.
 func Default(opt Options) *Registry {
 	if opt.ToolTimeout <= 0 {
 		opt.ToolTimeout = 5 * time.Second
@@ -37,6 +40,12 @@ func Default(opt Options) *Registry {
 	r.Register(writeFileTool(opt))
 	r.Register(memoryWriteTool(opt))
 	r.Register(memoryReadTool(opt))
+	r.Register(whoamiTool(opt))
+	for _, t := range opt.Extra {
+		if t != nil {
+			r.Register(t)
+		}
+	}
 	return r
 }
 
@@ -45,10 +54,14 @@ type execArgs struct {
 	CWD     string   `json:"cwd"`
 }
 
+// execTool runs argv inside the process jail. Tenant secrets from
+// Runtime.Secret are never copied into the child environment: `echo $TOKEN`
+// and printenv in the jail must not observe them. Secrets are for in-process
+// Go handlers (outbound HTTP) only.
 func execTool(opt Options) *Tool {
 	return &Tool{
 		Name:        "exec",
-		Description: "Run an allow-listed binary inside the workspace jail. Path arguments that escape the workspace are refused. No Docker required.",
+		Description: "Run an allow-listed binary inside the workspace jail. Path arguments that escape the workspace are refused. No Docker required. Tenant secrets are not injected into the jail environment.",
 		Timeout:     opt.ToolTimeout,
 		Schema: map[string]any{
 			"type":     "object",
@@ -248,6 +261,41 @@ func memoryReadTool(opt Options) *Tool {
 				return fmt.Sprintf("not found: key=%s", a.Key), nil
 			}
 			return v, nil
+		},
+	}
+}
+
+func whoamiTool(opt Options) *Tool {
+	return &Tool{
+		Name:        "whoami",
+		Description: "Return the authenticated tenant identity (tenant_id, subject, scopes). Never returns secrets. Without a runtime (CLI) the tenant is local.",
+		Timeout:     opt.ToolTimeout,
+		Schema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		},
+		Handler: func(ctx context.Context, _ string) (string, error) {
+			rt, ok := RuntimeFrom(ctx)
+			if !ok {
+				raw, err := json.Marshal(map[string]any{"tenant_id": "local"})
+				if err != nil {
+					return "", err
+				}
+				return string(raw), nil
+			}
+			scopes := rt.Scopes
+			if scopes == nil {
+				scopes = []string{}
+			}
+			raw, err := json.Marshal(map[string]any{
+				"tenant_id": rt.TenantID,
+				"subject":   rt.Subject,
+				"scopes":    scopes,
+			})
+			if err != nil {
+				return "", err
+			}
+			return string(raw), nil
 		},
 	}
 }

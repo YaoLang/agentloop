@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/YaoLang/agentloop/internal/auth"
 	"github.com/YaoLang/agentloop/internal/model"
 	"github.com/YaoLang/agentloop/internal/sandbox"
+	"github.com/YaoLang/agentloop/internal/tools"
 )
 
 const (
@@ -384,4 +386,245 @@ func waitRun(t *testing.T, s *Server, token, id string) RunRecord {
 	}
 	t.Fatalf("run %s did not finish: %s", id, rec.Body.String())
 	return RunRecord{}
+}
+
+func TestAdminSecretsSetListNoValuesNonAdminForbidden(t *testing.T) {
+	s := testServer(t)
+	createTenant(t, s, "acme", "Acme")
+	const secret = "gho_xxx_must_not_list"
+
+	rec := do(t, s, http.MethodPut, "/v1/admin/tenants/acme/secrets", testAdmin, map[string]string{
+		"name":  "github",
+		"value": secret,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put secret: %d %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), secret) {
+		t.Fatal("PUT response leaked secret value")
+	}
+
+	rec = do(t, s, http.MethodGet, "/v1/admin/tenants/acme/secrets", testAdmin, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list secrets: %d %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), secret) {
+		t.Fatal("list leaked secret value")
+	}
+	var listed struct {
+		Names []string `json:"names"`
+	}
+	decode(t, rec, &listed)
+	if len(listed.Names) != 1 || listed.Names[0] != "github" {
+		t.Fatalf("names=%v", listed.Names)
+	}
+
+	key := mintKey(t, s, "acme", []string{auth.ScopeRunsWrite})
+	rec = do(t, s, http.MethodPut, "/v1/admin/tenants/acme/secrets", key, map[string]string{
+		"name":  "github",
+		"value": "nope",
+	})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin PUT: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, s, http.MethodGet, "/v1/admin/tenants/acme/secrets", key, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin GET: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, s, http.MethodDelete, "/v1/admin/tenants/acme/secrets/github", key, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin DELETE: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, s, http.MethodDelete, "/v1/admin/tenants/acme/secrets/github", testAdmin, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, s, http.MethodGet, "/v1/admin/tenants/acme/secrets", testAdmin, nil)
+	decode(t, rec, &listed)
+	if len(listed.Names) != 0 {
+		t.Fatalf("after delete names=%v", listed.Names)
+	}
+}
+
+func TestTenantASecretNotVisibleToTenantBRuntime(t *testing.T) {
+	s := testServer(t)
+	createTenant(t, s, "alpha", "Alpha")
+	createTenant(t, s, "beta", "Beta")
+	const secret = "gho_xxx_alpha_only"
+	rec := do(t, s, http.MethodPut, "/v1/admin/tenants/alpha/secrets", testAdmin, map[string]string{
+		"name":  "github",
+		"value": secret,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put: %d %s", rec.Code, rec.Body.String())
+	}
+
+	got, ok := s.secrets.Get("alpha", "github")
+	if !ok || got != secret {
+		t.Fatalf("alpha Get: ok=%v", ok)
+	}
+	if _, ok := s.secrets.Get("beta", "github"); ok {
+		t.Fatal("beta must not see alpha secret via Get")
+	}
+
+	reg := tools.NewRegistry()
+	reg.Register(tools.HasSecretTool())
+
+	ctxA := tools.WithRuntime(context.Background(), tools.Runtime{
+		TenantID: "alpha",
+		Secret: func(name string) (string, bool) {
+			return s.secrets.Get("alpha", name)
+		},
+	})
+	out, err := reg.Call(ctxA, "has_secret", `{"name":"github"}`)
+	if err != nil || out != "present" {
+		t.Fatalf("alpha has_secret: out=%q err=%v", out, err)
+	}
+	if strings.Contains(out, secret) {
+		t.Fatal("value leaked")
+	}
+
+	ctxB := tools.WithRuntime(context.Background(), tools.Runtime{
+		TenantID: "beta",
+		Secret: func(name string) (string, bool) {
+			return s.secrets.Get("beta", name)
+		},
+	})
+	out, err = reg.Call(ctxB, "has_secret", `{"name":"github"}`)
+	if err != nil || out != "absent" {
+		t.Fatalf("beta has_secret: out=%q err=%v", out, err)
+	}
+}
+
+func TestExtraToolsOnDaemonConfigAdvertisedAndCallable(t *testing.T) {
+	sawPing := false
+	s := testServer(t, func(c *Config) {
+		c.ExtraTools = func(opt tools.Options) []*tools.Tool {
+			return []*tools.Tool{{
+				Name:        "ping",
+				Description: "return pong",
+				Handler: func(ctx context.Context, argsJSON string) (string, error) {
+					return "pong", nil
+				},
+			}}
+		}
+		c.NewModel = func(name string) (model.Model, error) {
+			return &extraToolModel{sawPing: &sawPing}, nil
+		}
+	})
+	createTenant(t, s, "acme", "Acme")
+	key := mintKey(t, s, "acme", []string{auth.ScopeRunsWrite})
+	rec := do(t, s, http.MethodPost, "/v1/runs", key, map[string]string{"goal": "ping extra", "model": "mock"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("run: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	decode(t, rec, &created)
+	got := waitRun(t, s, key, created.ID)
+	if got.Status != statusCompleted {
+		t.Fatalf("status=%s err=%s", got.Status, got.Error)
+	}
+	if !sawPing {
+		t.Fatal("ping was not advertised to the model")
+	}
+	if got.Final != "pong-seen" {
+		t.Fatalf("final=%q (extra tool not callable?)", got.Final)
+	}
+}
+
+type extraToolModel struct {
+	sawPing *bool
+	step    int
+}
+
+func (m *extraToolModel) Name() string { return "mock" }
+
+func (m *extraToolModel) Complete(_ context.Context, req model.CompleteRequest) (model.CompleteResponse, error) {
+	for _, spec := range req.Tools {
+		if spec.Name == "ping" && m.sawPing != nil {
+			*m.sawPing = true
+		}
+	}
+	m.step++
+	if m.step == 1 {
+		return model.CompleteResponse{
+			Message: model.Message{
+				Role: "assistant",
+				ToolCalls: []model.ToolCall{{
+					ID:        "call_ping",
+					Name:      "ping",
+					Arguments: "{}",
+				}},
+			},
+		}, nil
+	}
+	return model.CompleteResponse{
+		Message: model.Message{Role: "assistant", Content: "pong-seen"},
+	}, nil
+}
+
+func TestSecretsFileMode0600(t *testing.T) {
+	s := testServer(t)
+	createTenant(t, s, "acme", "Acme")
+	if err := s.secrets.Put("acme", "github", "gho_mode"); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.cfg.DataDir, "tenants", "acme", "secrets.json")
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("mode=%o want 0600", st.Mode().Perm())
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte("github")) {
+		t.Fatal("name missing on disk")
+	}
+}
+
+func TestWhoamiOnDaemonRunSeesPrincipal(t *testing.T) {
+	s := testServer(t, func(c *Config) {
+		c.NewModel = func(name string) (model.Model, error) {
+			return model.NewScripted([]model.Step{
+				{Tool: "whoami", Args: map[string]any{}},
+				{Content: "ok"},
+			}), nil
+		}
+	})
+	createTenant(t, s, "acme", "Acme")
+	key := mintKey(t, s, "acme", []string{auth.ScopeRunsWrite})
+	rec := do(t, s, http.MethodPost, "/v1/runs", key, map[string]string{"goal": "who am i", "model": "mock"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("run: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	decode(t, rec, &created)
+	got := waitRun(t, s, key, created.ID)
+	if got.Status != statusCompleted {
+		t.Fatalf("status=%s err=%s", got.Status, got.Error)
+	}
+	// session is on disk under the tenant workspace
+	sessPath := filepath.Join(s.cfg.DataDir, "tenants", "acme", "workspace", ".agentloop", "session.json")
+	raw, err := os.ReadFile(sessPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`tenant_id`)) || !bytes.Contains(raw, []byte(`acme`)) {
+		t.Fatalf("whoami observation missing tenant: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte(`"name": "whoami"`)) && !bytes.Contains(raw, []byte(`"name":"whoami"`)) {
+		t.Fatalf("whoami tool trace missing: %s", raw)
+	}
+	if bytes.Contains(raw, []byte("gho_")) {
+		t.Fatal("secret-like value in session")
+	}
 }
