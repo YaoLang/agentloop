@@ -18,7 +18,7 @@
 | --- | --- |
 | 循环 | `模型 → 工具调用 → 观察 → 继续`，有步数、墙钟、token、费用预算 |
 | 模型 | `Model` 接口。**Mock**（确定性、无网络）。**OpenAI 兼容** HTTP（`OPENAI_BASE_URL` + `OPENAI_API_KEY`） |
-| 工具 | `exec`、`read_file`、`write_file`、`memory_write`、`memory_read`、`whoami`。自定义：`Options.Extra` / `Config.ExtraTools` |
+| 工具 | `exec`、`read_file`、`write_file`、`memory_write`、`memory_read`、`whoami`、`http_call`（目录驱动）。自定义 Go：`Options.Extra` / `Config.ExtraTools` |
 | 沙盒 | 进程 jail。路径封禁。二进制白名单。超时。输出封顶。子进程环境**只有 PATH**。不用 Docker |
 | 鉴权 | 插件链：admin key → 哈希 API key（`alk_…`）→ HS256 JWT。OIDC 再实现一个 `Authenticator` 即可 |
 | 隔离 | 每租户独立 workspace、run、密钥、并发配额。跨租户取 run 返回 **404** |
@@ -43,6 +43,7 @@ flowchart TB
   Reg --> Files["read_file / write_file"]
   Reg --> Mem[memory]
   Reg --> Who[whoami]
+  Reg --> HTTP[http_call]
   Loop --> Trace[JSONL trace]
   Eval[评测] --> Loop
 ```
@@ -122,6 +123,7 @@ Loop 故意写得很小。没有 chain 框架，没有 prompt 图。
 | `read_file` / `write_file` | workspace 内 UTF-8 文件。`..` 和绝对路径逃逸会被拒绝。 |
 | `memory_write` / `memory_read` | `scope=session`（进程内）或 `longterm`（只追加 JSONL）。 |
 | `whoami` | `{tenant_id, subject, scopes}`。CLI 没有 Runtime 时返回 `{"tenant_id":"local"}`。从不打印密钥。 |
+| `http_call` | 一个工具对应多个接口。模型只选目录里的 `endpoint` id，不能传 URL、method 或 Authorization。 |
 
 ### 沙盒约定
 
@@ -237,6 +239,7 @@ JWT（HS256）是另一套内置插件。Claims：`sub`、`tid`、`scp`（数组
 data/
   keys.json                                 # 只有 SHA-256
   tenants/{id}/meta.json
+  tenants/{id}/http.json                    # 可选的出站 API 目录（不在 workspace/ 内）
   tenants/{id}/workspace/                   # agent.Run 的 Workspace
   tenants/{id}/secrets.json                 # 权限 0600；GET 不返回 value
   tenants/{id}/runs/{runID}/status.json
@@ -269,17 +272,17 @@ type Authenticator interface {
 
 自定义工具能看到已鉴权的租户，**但不会**把密钥泄漏给模型或 exec jail。
 
-在内置工具之后注册：
+- `tools.Options.Extra` — `tools.Default` 先注册内置工具（有目录时包括 `http_call`），再 Extra（后 `Register` 覆盖同名）。
+- `daemon.Config.ExtraTools func(opt tools.Options) []*tools.Tool` — **每次 run** 调用一次，结果赋给 `opt.Extra`。ExtraTools 仍可用于自定义 Go handler。
 
-- `tools.Options.Extra` — `tools.Default` 先注册 exec / 文件 / 记忆 / `whoami`，再 Extra（后 `Register` 覆盖同名）。
-- `daemon.Config.ExtraTools func(opt tools.Options) []*tools.Tool` — **每次 run** 调用一次，结果赋给 `opt.Extra`。
+接入站点自己的 HTTP API，**推荐**用租户目录 + `http_call`（见下一节）。ExtraTools 留给不是 HTTP API 的能力。
 
 从 run 的 context 读身份（只给 Go handler 用，不是工具参数）：
 
 ```go
 rt, ok := tools.RuntimeFrom(ctx)
 p, ok := auth.PrincipalFrom(ctx)
-token, ok := rt.Secret("github") // 没有则 ok=false；永远不要打印 token
+token, ok := rt.Secret("shop_token") // 没有则 ok=false；永远不要打印 token
 ```
 
 `agentloopd` 会在 `agent.Run` 已经传给 `Registry.Call` 的同一个 `ctx` 上挂上 `auth.WithPrincipal` 和 `tools.WithRuntime`。CLI 没有租户，此时 `whoami` 报 `tenant_id=local`。
@@ -290,48 +293,33 @@ Admin 写密钥：
 curl -sS -X PUT localhost:8080/v1/admin/tenants/acme/secrets \
   -H "Authorization: Bearer $AGENTLOOP_ADMIN_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"github","value":"gho_…"}'
+  -d '{"name":"shop_token","value":"…"}'
 ```
 
-示例 handler（只出现在文档里，二进制不含 GitHub 工具）：
+---
 
-```go
-func githubWhoamiTool() *tools.Tool {
-    return &tools.Tool{
-        Name:        "github_whoami",
-        Description: "用租户的 github 密钥 GET https://api.github.com/user。从不打印 token。",
-        Schema: map[string]any{
-            "type":       "object",
-            "properties": map[string]any{},
-        },
-        Handler: func(ctx context.Context, _ string) (string, error) {
-            rt, ok := tools.RuntimeFrom(ctx)
-            if !ok {
-                return "", fmt.Errorf("no runtime")
-            }
-            token, ok := rt.Secret("github")
-            if !ok {
-                return "github secret not configured", nil
-            }
-            req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user", nil)
-            if err != nil {
-                return "", err
-            }
-            req.Header.Set("Authorization", "Bearer "+token)
-            req.Header.Set("User-Agent", "agentloop")
-            res, err := http.DefaultClient.Do(req)
-            if err != nil {
-                return "", err
-            }
-            defer res.Body.Close()
-            body, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
-            return string(body), nil
-        },
-    }
-}
-```
+## HTTP 目录（`http_call`）
 
-用 `Config.ExtraTools` 返回 `[]*tools.Tool{githubWhoamiTool()}`。密钥走 `PUT /v1/admin/tenants/{id}/secrets`。模型只能看到 GitHub 响应体，看不到 `gho_…`。
+把 `agentloopd` 嵌进自己的站点，用**一个**工具接你的 HTTP API，而不是每个接口一个工具。模型从租户目录里选 `endpoint` id，不能传 URL、method 或 `Authorization`。
+
+目录放在 `meta.json` **旁边**，**不要**放进 `workspace/`（这样 `write_file` 改不了白名单）：
+
+`data/tenants/{id}/http.json`
+
+示例见 [`examples/http.json`](examples/http.json)。
+
+| 字段 | 作用 |
+| --- | --- |
+| `base_url` | 只允许 http / https。禁止 userinfo。 |
+| `allow_hosts` | 主机名精确匹配（大小写不敏感，不含端口）。为空则用 `base_url` 的 host。 |
+| `auth.secret` | 租户密钥的**名字**（`PUT /v1/admin/tenants/{id}/secrets`）。写入 `auth.header`（默认 `Authorization`）= `auth.prefix` + 值。 |
+| `endpoints` | `{id, method, path, description}`。`path` 可用 `{name}` 占位符，由工具参数 `path` 填充。方法：GET、POST、PUT、PATCH、DELETE。 |
+
+工具参数：`{endpoint, path, query, body}`。模型多传的 `url` / `method` / `headers` 会被忽略。
+
+SSRF：只允许 http/https；拒绝 userinfo；主机名必须在 `allow_hosts` 中；解析到的 IP 若是回环 / 私网 / 链路本地 / 组播 / 未指定 / `169.254.169.254` 则拒绝，除非 `allow_hosts` 里就是这个**字面 IP**（所以 `httptest` 的 `127.0.0.1` 可以工作）。CheckRedirect：只跟同 host，最多 5 次；跨 host 重定向报错。
+
+观察格式是 `HTTP {status}\n{body}`。从不回显请求头。JSON 里匹配 `(?i)token|secret|password|authorization|api[_-]?key` 的键会被替换成 `[redacted]`。若密钥原文仍出现会被去掉。HTTP 4xx/5xx 仍算工具成功，循环可以继续。目录缺失或无效时不注册 `http_call`，run 照常进行。
 
 ---
 
@@ -352,6 +340,7 @@ internal/trace/         JSONL 写入 / 回放
 internal/eval/          套件加载、打分、表格
 internal/cli/           run / eval / replay / demo
 evals/suites/           JSONL case
+examples/http.json      租户 HTTP 目录示例
 docs/superpowers/specs/ 设计说明
 ```
 

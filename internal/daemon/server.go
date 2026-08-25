@@ -384,6 +384,25 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"id": rec.ID, "status": rec.Status})
 }
 
+var httpCatalogLogged sync.Map // tenant id → logged invalid catalog
+
+func (s *Server) attachHTTPCatalog(opt *tools.Options, tenantID string) {
+	path := s.store.HTTPCatalogPath(tenantID)
+	cat, err := tools.LoadHTTPCatalog(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		if _, loaded := httpCatalogLogged.LoadOrStore(tenantID, true); !loaded {
+			log.Printf("agentloopd: tenant=%s http catalog: %v (http_call not registered)", tenantID, err)
+		}
+		return
+	}
+	if cat != nil && len(cat.Endpoints) > 0 {
+		opt.HTTP = cat
+	}
+}
+
 func (s *Server) executeRun(rec RunRecord, p auth.Principal) {
 	defer s.quota.release(rec.TenantID)
 	defer func() {
@@ -428,6 +447,7 @@ func (s *Server) executeRun(rec RunRecord, p auth.Principal) {
 		Memory:      mem,
 		ToolTimeout: s.cfg.ToolTimeout,
 	}
+	s.attachHTTPCatalog(&opt, rec.TenantID)
 	if s.cfg.ExtraTools != nil {
 		opt.Extra = s.cfg.ExtraTools(opt)
 	}

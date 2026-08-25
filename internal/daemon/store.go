@@ -79,6 +79,12 @@ func (s *Store) workspace(id string) string {
 	return filepath.Join(s.tenantDir(id), "workspace")
 }
 
+// HTTPCatalogPath is data/tenants/{id}/http.json — next to meta.json,
+// not inside workspace/ (write_file cannot rewrite the allowlist).
+func (s *Store) HTTPCatalogPath(id string) string {
+	return filepath.Join(s.tenantDir(id), "http.json")
+}
+
 func (s *Store) runDir(tenantID, runID string) string {
 	return filepath.Join(s.tenantDir(tenantID), "runs", runID)
 }

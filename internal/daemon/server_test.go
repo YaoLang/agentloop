@@ -628,3 +628,118 @@ func TestWhoamiOnDaemonRunSeesPrincipal(t *testing.T) {
 		t.Fatal("secret-like value in session")
 	}
 }
+
+func TestHTTPCatalogPathAndMissingFile(t *testing.T) {
+	s := testServer(t)
+	createTenant(t, s, "acme", "Acme")
+	path := s.store.HTTPCatalogPath("acme")
+	wantSuffix := filepath.Join("tenants", "acme", "http.json")
+	if !strings.HasSuffix(path, wantSuffix) {
+		t.Fatalf("path=%s want suffix %s", path, wantSuffix)
+	}
+	if strings.Contains(path, "workspace") {
+		t.Fatalf("catalog must not live under workspace: %s", path)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("missing catalog should not exist: %v", err)
+	}
+	key := mintKey(t, s, "acme", []string{auth.ScopeRunsWrite})
+	rec := do(t, s, http.MethodPost, "/v1/runs", key, map[string]string{"goal": "hello", "model": "mock"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("run without catalog: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	decode(t, rec, &created)
+	got := waitRun(t, s, key, created.ID)
+	if got.Status != statusCompleted && got.Status != statusFailed {
+		t.Fatalf("status=%s err=%s", got.Status, got.Error)
+	}
+}
+
+func TestHTTPCatalogAdvertisedWhenPresent(t *testing.T) {
+	saw := false
+	srv := testServer(t, func(c *Config) {
+		c.NewModel = func(name string) (model.Model, error) {
+			return &httpCatalogProbe{saw: &saw}, nil
+		}
+	})
+	createTenant(t, srv, "acme", "Acme")
+	cat := map[string]any{
+		"base_url":    "https://api.example.com",
+		"allow_hosts": []string{"api.example.com"},
+		"endpoints": []map[string]string{
+			{"id": "list_orders", "method": "GET", "path": "/v1/orders", "description": "List orders"},
+		},
+	}
+	raw, err := json.Marshal(cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(srv.store.HTTPCatalogPath("acme"), raw, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	key := mintKey(t, srv, "acme", []string{auth.ScopeRunsWrite})
+	rec := do(t, srv, http.MethodPost, "/v1/runs", key, map[string]string{"goal": "list", "model": "mock"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("run: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	decode(t, rec, &created)
+	got := waitRun(t, srv, key, created.ID)
+	if got.Status != statusCompleted {
+		t.Fatalf("status=%s err=%s", got.Status, got.Error)
+	}
+	if !saw {
+		t.Fatal("http_call was not advertised to the model")
+	}
+}
+
+func TestInvalidHTTPCatalogDoesNotRegister(t *testing.T) {
+	saw := false
+	srv := testServer(t, func(c *Config) {
+		c.NewModel = func(name string) (model.Model, error) {
+			return &httpCatalogProbe{saw: &saw}, nil
+		}
+	})
+	createTenant(t, srv, "acme", "Acme")
+	if err := os.WriteFile(srv.store.HTTPCatalogPath("acme"), []byte(`{not-json`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	key := mintKey(t, srv, "acme", []string{auth.ScopeRunsWrite})
+	rec := do(t, srv, http.MethodPost, "/v1/runs", key, map[string]string{"goal": "x", "model": "mock"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("run: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	decode(t, rec, &created)
+	got := waitRun(t, srv, key, created.ID)
+	if got.Status != statusCompleted && got.Status != statusFailed {
+		t.Fatalf("invalid catalog must not break the run: %s %s", got.Status, got.Error)
+	}
+	if saw {
+		t.Fatal("http_call registered from invalid catalog")
+	}
+}
+
+type httpCatalogProbe struct {
+	saw *bool
+}
+
+func (m *httpCatalogProbe) Name() string { return "mock" }
+
+func (m *httpCatalogProbe) Complete(_ context.Context, req model.CompleteRequest) (model.CompleteResponse, error) {
+	for _, spec := range req.Tools {
+		if spec.Name == "http_call" && m.saw != nil {
+			*m.saw = true
+		}
+	}
+	return model.CompleteResponse{
+		Message: model.Message{Role: "assistant", Content: "ok"},
+	}, nil
+}

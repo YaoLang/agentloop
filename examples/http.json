@@ -1,0 +1,14 @@
+{
+  "base_url": "https://api.example.com",
+  "allow_hosts": ["api.example.com"],
+  "auth": {
+    "secret": "shop_token",
+    "header": "Authorization",
+    "prefix": "Bearer "
+  },
+  "endpoints": [
+    {"id": "list_orders", "method": "GET", "path": "/v1/orders", "description": "List orders"},
+    {"id": "get_order", "method": "GET", "path": "/v1/orders/{id}", "description": "Get one order"},
+    {"id": "create_order", "method": "POST", "path": "/v1/orders", "description": "Create order"}
+  ]
+}

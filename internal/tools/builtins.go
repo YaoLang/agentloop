@@ -21,12 +21,14 @@ type Options struct {
 	MaxOutput   int
 	AllowBins   []string
 	DenyBins    []string
+	// HTTP, if set with at least one endpoint, registers http_call.
+	HTTP *HTTPCatalog
 	// Extra tools are registered after the builtins (last Register wins).
 	Extra []*Tool
 }
 
 // Default registers exec, read_file, write_file, memory_write, memory_read,
-// whoami, then Extra.
+// whoami, optional http_call (when HTTP catalog is set), then Extra.
 func Default(opt Options) *Registry {
 	if opt.ToolTimeout <= 0 {
 		opt.ToolTimeout = 5 * time.Second
@@ -41,6 +43,9 @@ func Default(opt Options) *Registry {
 	r.Register(memoryWriteTool(opt))
 	r.Register(memoryReadTool(opt))
 	r.Register(whoamiTool(opt))
+	if opt.HTTP != nil && len(opt.HTTP.Endpoints) > 0 {
+		r.Register(HTTPCallTool(opt))
+	}
 	for _, t := range opt.Extra {
 		if t != nil {
 			r.Register(t)

@@ -18,7 +18,7 @@ This repository is **original open-source work** by [Yaolang Kong](https://githu
 | --- | --- |
 | Loop | `model → tool calls → observe → continue`, with max steps, wall-clock timeout, token and cost budgets |
 | Model | `Model` interface. **Mock** (deterministic, no network). **OpenAI-compatible** HTTP via `OPENAI_BASE_URL` + `OPENAI_API_KEY` |
-| Tools | `exec`, `read_file`, `write_file`, `memory_write`, `memory_read`, `whoami`. Custom tools via `Options.Extra` / `Config.ExtraTools` |
+| Tools | `exec`, `read_file`, `write_file`, `memory_write`, `memory_read`, `whoami`, `http_call` (catalog-driven). Custom Go via `Options.Extra` / `Config.ExtraTools` |
 | Sandbox | Process jail. Path confinement. Binary allow-list. Timeouts. Stdout/stderr caps. Exec env is **PATH only**. No Docker |
 | Auth | Plugin chain: admin key → hashed API key (`alk_…`) → HS256 JWT. Add OIDC as another `Authenticator` |
 | Isolation | Per-tenant workspace, runs, secrets, concurrency quota. Cross-tenant run fetch is **404** |
@@ -43,6 +43,7 @@ flowchart TB
   Reg --> Files["read_file / write_file"]
   Reg --> Mem[memory]
   Reg --> Who[whoami]
+  Reg --> HTTP[http_call]
   Loop --> Trace[JSONL trace]
   Eval[Eval harness] --> Loop
 ```
@@ -122,6 +123,7 @@ Workspace after a run:
 | `read_file` / `write_file` | UTF-8 files under the workspace. `..` and absolute escapes are refused. |
 | `memory_write` / `memory_read` | `scope=session` (in-process) or `longterm` (append-only JSONL). |
 | `whoami` | `{tenant_id, subject, scopes}`. CLI without a Runtime returns `{"tenant_id":"local"}`. Never prints secrets. |
+| `http_call` | One tool, many endpoints. The model picks a catalog `endpoint` id. It cannot pass URL, method, or Authorization. |
 
 ### Sandbox contract
 
@@ -237,6 +239,7 @@ On disk:
 data/
   keys.json                                 # SHA-256 hashes only
   tenants/{id}/meta.json
+  tenants/{id}/http.json                    # optional outbound API catalog (not in workspace/)
   tenants/{id}/workspace/                   # agent.Run Workspace
   tenants/{id}/secrets.json                 # mode 0600; values never listed on GET
   tenants/{id}/runs/{runID}/status.json
@@ -269,17 +272,17 @@ Default chain: **admin → API key (`alk_…`) → JWT HS256**.
 
 Custom tools see the authenticated tenant **without** leaking secrets to the model or the exec jail.
 
-Register extras after the builtins:
+- `tools.Options.Extra` — `tools.Default` registers builtins (including `http_call` when a catalog is set), then Extra (last `Register` wins).
+- `daemon.Config.ExtraTools func(opt tools.Options) []*tools.Tool` — called **per run**; the slice is assigned to `opt.Extra`. ExtraTools still exists for custom Go handlers.
 
-- `tools.Options.Extra` — `tools.Default` registers exec / files / memory / `whoami`, then Extra (last `Register` wins).
-- `daemon.Config.ExtraTools func(opt tools.Options) []*tools.Tool` — called **per run**; the slice is assigned to `opt.Extra`.
+The **supported** way to connect a site's HTTP APIs is the tenant catalog + `http_call` (below). ExtraTools is for capabilities that are not an HTTP API.
 
 Read identity from the run context (Go handlers only — this is not a tool argument):
 
 ```go
 rt, ok := tools.RuntimeFrom(ctx)
 p, ok := auth.PrincipalFrom(ctx)
-token, ok := rt.Secret("github") // missing → ok=false; never print token
+token, ok := rt.Secret("shop_token") // missing → ok=false; never print token
 ```
 
 `agentloopd` attaches `auth.WithPrincipal` and `tools.WithRuntime` on the same `ctx` that `agent.Run` already passes to `Registry.Call`. The CLI has no tenant; `whoami` then reports `tenant_id=local`.
@@ -290,48 +293,33 @@ Admin secrets API:
 curl -sS -X PUT localhost:8080/v1/admin/tenants/acme/secrets \
   -H "Authorization: Bearer $AGENTLOOP_ADMIN_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"github","value":"gho_…"}'
+  -d '{"name":"shop_token","value":"…"}'
 ```
 
-Example handler (README only — there is no live GitHub tool in the binary):
+---
 
-```go
-func githubWhoamiTool() *tools.Tool {
-    return &tools.Tool{
-        Name:        "github_whoami",
-        Description: "GET https://api.github.com/user using the tenant github secret. Never prints the token.",
-        Schema: map[string]any{
-            "type":       "object",
-            "properties": map[string]any{},
-        },
-        Handler: func(ctx context.Context, _ string) (string, error) {
-            rt, ok := tools.RuntimeFrom(ctx)
-            if !ok {
-                return "", fmt.Errorf("no runtime")
-            }
-            token, ok := rt.Secret("github")
-            if !ok {
-                return "github secret not configured", nil
-            }
-            req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user", nil)
-            if err != nil {
-                return "", err
-            }
-            req.Header.Set("Authorization", "Bearer "+token)
-            req.Header.Set("User-Agent", "agentloop")
-            res, err := http.DefaultClient.Do(req)
-            if err != nil {
-                return "", err
-            }
-            defer res.Body.Close()
-            body, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
-            return string(body), nil
-        },
-    }
-}
-```
+## HTTP catalog (`http_call`)
 
-Wire it with `Config.ExtraTools` returning `[]*tools.Tool{githubWhoamiTool()}`. Put the token via `PUT /v1/admin/tenants/{id}/secrets`. The model only sees the GitHub API body, never `gho_…`.
+Embed `agentloopd` in your site and connect **your** HTTP APIs through one tool. There is not one tool per endpoint. The model picks an `endpoint` id from the tenant catalog; it cannot pass URL, method, or `Authorization`.
+
+Place the catalog **next to** `meta.json`, **not** inside `workspace/` (so `write_file` cannot rewrite the allowlist):
+
+`data/tenants/{id}/http.json`
+
+See [`examples/http.json`](examples/http.json).
+
+| Field | Role |
+| --- | --- |
+| `base_url` | http or https only. No userinfo. |
+| `allow_hosts` | Exact hostname match (case-insensitive, no port). Empty → host of `base_url`. |
+| `auth.secret` | **Name** of a tenant secret (`PUT /v1/admin/tenants/{id}/secrets`). Injected as `auth.header` (default `Authorization`) = `auth.prefix` + value. |
+| `endpoints` | `{id, method, path, description}`. `path` may contain `{name}` placeholders filled from the tool's `path` object. Methods: GET, POST, PUT, PATCH, DELETE. |
+
+Tool args: `{endpoint, path, query, body}`. Extra fields such as `url` / `method` / `headers` are ignored.
+
+SSRF: scheme http/https only; userinfo refused; hostname must be in `allow_hosts`; resolved IPs that are loopback / private / link-local / multicast / unspecified / `169.254.169.254` are refused unless that **literal IP** is in `allow_hosts` (so `httptest` on `127.0.0.1` works). CheckRedirect: same host, max 5; cross-host redirect is an error.
+
+Observations are `HTTP {status}\n{body}`. Request headers are never echoed. JSON keys matching `(?i)token|secret|password|authorization|api[_-]?key` are replaced with `[redacted]`. The raw secret value is stripped if it still appears. HTTP 4xx/5xx is still a successful tool call so the loop can recover. Missing or invalid catalog: `http_call` is not registered; the run still proceeds.
 
 ---
 
@@ -352,6 +340,7 @@ internal/trace/         JSONL writer / replay
 internal/eval/          suite loader, scorers, table
 internal/cli/           run / eval / replay / demo
 evals/suites/           JSONL cases
+examples/http.json      sample tenant HTTP catalog
 docs/superpowers/specs/ design notes
 ```
 
