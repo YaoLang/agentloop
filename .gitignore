@@ -22,3 +22,8 @@ demo-workspace/
 .vscode/
 *.swp
 .DS_Store
+
+# Daemon data (keys hashes, tenant workspaces) — never commit
+/data/
+/agentloopd
+/agentloopd.exe

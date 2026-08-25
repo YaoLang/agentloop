@@ -130,11 +130,79 @@ Score   success=14/14 (100%)  schema=100%  jail=6/6  …
 
 ---
 
+## Cloud daemon
+
+`agentloopd` is a multi-tenant HTTP process: pluggable auth, one OS process, many users. Isolation is the existing **process jail** — there is no Docker. Each tenant's `agent.Run` uses `data/tenants/{id}/workspace` and a fresh tool registry. The CLI (`cmd/agentloop`) is unchanged.
+
+Design notes: [`docs/superpowers/specs/2026-08-25-agentloopd-design.md`](docs/superpowers/specs/2026-08-25-agentloopd-design.md).
+
+### Run
+
+```bash
+export AGENTLOOP_ADMIN_KEY=change-me
+export AGENTLOOP_JWT_SECRET=change-me-too   # optional; enables HS256 JWT
+go run ./cmd/agentloopd -addr :8080 -data ./data -model mock
+```
+
+`GET /healthz` is unauthenticated. Everything under `/v1` requires `Authorization: Bearer …`.
+
+### Create a tenant, mint a key, start a run
+
+```bash
+# admin: create tenant
+curl -sS -X POST localhost:8080/v1/admin/tenants \
+  -H "Authorization: Bearer $AGENTLOOP_ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"acme","name":"Acme"}'
+
+# admin: mint an API key (plaintext secret is returned once; disk stores SHA-256 only)
+KEY=$(curl -sS -X POST localhost:8080/v1/admin/keys \
+  -H "Authorization: Bearer $AGENTLOOP_ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"acme","scopes":["runs:write"]}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["secret"])')
+
+# tenant: start a mock run (202)
+RUN=$(curl -sS -X POST localhost:8080/v1/runs \
+  -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"goal":"Write a note","model":"mock"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# tenant: poll
+curl -sS localhost:8080/v1/runs/$RUN -H "Authorization: Bearer $KEY"
+# live events: GET /v1/runs/$RUN/events  (SSE)
+```
+
+JWT (HS256) is the other built-in plugin. Claims: `sub`, `tid`, `scp`. Sign with `AGENTLOOP_JWT_SECRET`.
+
+### Isolation
+
+- On-disk: `data/tenants/{id}/workspace`, `…/runs/{runID}/`, `data/keys.json`.
+- A run is loaded only from the **caller’s** tenant directory. Tenant B fetching tenant A’s run id gets **404** (never the contents).
+- Tools are jailed to that workspace (`JailPath`, binary allow-list, timeouts). Tenant A writing `agent-notes.txt` does not appear in tenant B’s workspace; an absolute path into A is a jail miss.
+- Per-tenant concurrency default 8; over the cap → **429**.
+- 401 missing/invalid credentials; 403 wrong scope (e.g. a tenant key hitting `/v1/admin/*`).
+
+### How to add an Authenticator
+
+```go
+type Authenticator interface {
+    Name() string
+    Authenticate(r *http.Request) (Principal, error) // return auth.ErrSkip if this method's creds are absent
+}
+```
+
+Implement the interface (skip when your credential type is missing; return `ErrUnauthorized` when it is present but invalid). Insert it into the chain in `daemon.New` — first non-skip success wins. Do not log raw keys.
+
+---
+
 ## Layout
 
 ```
 cmd/agentloop/          CLI
+cmd/agentloopd/         multi-tenant HTTP daemon
 internal/agent/         the loop + budgets
+internal/auth/          pluggable Authenticator chain (API key, JWT, admin)
+internal/daemon/        HTTP API, tenant store, quota
 internal/model/         Model interface, mock, OpenAI client
 internal/tools/         registry, schema, builtins
 internal/sandbox/       process jail
@@ -144,6 +212,7 @@ internal/trace/         JSONL writer / replay
 internal/eval/          suite loader, scorers, table
 internal/cli/           run / eval / replay / demo
 evals/suites/           JSONL cases
+docs/superpowers/specs/ design notes
 ```
 
 ---
