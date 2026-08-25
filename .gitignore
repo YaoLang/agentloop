@@ -1,0 +1,24 @@
+# Binaries
+/agentloop
+/agentloop.exe
+*.exe
+*.test
+*.out
+coverage.out
+dist/
+
+# Workspace runtime (created by run/demo)
+.agentloop/
+demo-workspace/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
