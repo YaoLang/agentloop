@@ -85,6 +85,12 @@ func (s *Store) HTTPCatalogPath(id string) string {
 	return filepath.Join(s.tenantDir(id), "http.json")
 }
 
+// ContextCatalogPath is data/tenants/{id}/context.json — next to meta.json,
+// not inside workspace/ (write_file cannot rewrite inject rules).
+func (s *Store) ContextCatalogPath(id string) string {
+	return filepath.Join(s.tenantDir(id), "context.json")
+}
+
 func (s *Store) runDir(tenantID, runID string) string {
 	return filepath.Join(s.tenantDir(tenantID), "runs", runID)
 }

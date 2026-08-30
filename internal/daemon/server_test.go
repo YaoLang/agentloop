@@ -743,3 +743,65 @@ func (m *httpCatalogProbe) Complete(_ context.Context, req model.CompleteRequest
 		Message: model.Message{Role: "assistant", Content: "ok"},
 	}, nil
 }
+
+func TestContextCatalogPathAndMissingFile(t *testing.T) {
+	s := testServer(t)
+	createTenant(t, s, "acme", "Acme")
+	path := s.store.ContextCatalogPath("acme")
+	wantSuffix := filepath.Join("tenants", "acme", "context.json")
+	if !strings.HasSuffix(path, wantSuffix) {
+		t.Fatalf("path=%s want suffix %s", path, wantSuffix)
+	}
+	if strings.Contains(path, "workspace") {
+		t.Fatalf("catalog must not live under workspace: %s", path)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("missing catalog should not exist: %v", err)
+	}
+}
+
+func TestContextCatalogDirectReply(t *testing.T) {
+	srv := testServer(t)
+	createTenant(t, srv, "acme", "Acme")
+	raw := []byte(`{"rules":[{"id":"ping","match":{"goal_prefix":"ping"},"direct_reply":"pong"}]}`)
+	if err := os.WriteFile(srv.store.ContextCatalogPath("acme"), raw, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	key := mintKey(t, srv, "acme", []string{auth.ScopeRunsWrite})
+	rec := do(t, srv, http.MethodPost, "/v1/runs", key, map[string]string{"goal": "ping svc", "model": "mock"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("run: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	decode(t, rec, &created)
+	got := waitRun(t, srv, key, created.ID)
+	if got.Status != statusCompleted {
+		t.Fatalf("status=%s err=%s", got.Status, got.Error)
+	}
+	if got.Final != "pong" || got.StopReason != "direct_reply" {
+		t.Fatalf("final=%q stop=%q", got.Final, got.StopReason)
+	}
+}
+
+func TestInvalidContextCatalogDoesNotBreakRun(t *testing.T) {
+	srv := testServer(t)
+	createTenant(t, srv, "acme", "Acme")
+	if err := os.WriteFile(srv.store.ContextCatalogPath("acme"), []byte(`{bad`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	key := mintKey(t, srv, "acme", []string{auth.ScopeRunsWrite})
+	rec := do(t, srv, http.MethodPost, "/v1/runs", key, map[string]string{"goal": "hello", "model": "mock"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("run: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	decode(t, rec, &created)
+	got := waitRun(t, srv, key, created.ID)
+	if got.Status != statusCompleted && got.Status != statusFailed {
+		t.Fatalf("invalid catalog must not break the run: %s %s", got.Status, got.Error)
+	}
+}
