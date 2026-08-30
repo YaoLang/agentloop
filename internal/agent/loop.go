@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YaoLang/agentloop/internal/inject"
 	"github.com/YaoLang/agentloop/internal/memory"
 	"github.com/YaoLang/agentloop/internal/model"
 	"github.com/YaoLang/agentloop/internal/sandbox"
@@ -44,6 +45,7 @@ type Config struct {
 	RunID          string
 	ModelRetries   int           // default 3
 	ModelRetryWait time.Duration // default 50ms (tests stay fast)
+	ContextInject  *inject.Catalog
 }
 
 // Result is the outcome of a loop.
@@ -124,7 +126,6 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		Role:    "system",
 		Content: systemPrompt(),
 	})
-	sess.Add(model.Message{Role: "user", Content: cfg.Goal})
 
 	tw, err := trace.New(filepath.Join(cfg.Workspace, ".agentloop", "traces", cfg.RunID+".jsonl"))
 	if err != nil {
@@ -137,6 +138,16 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	out := &Result{TracePath: tw.Path(), Session: sess}
 	start := time.Now()
 	specs := cfg.Registry.Specs()
+
+	if hit := applyContextInject(cfg, sess, tw); hit != nil {
+		sess.Add(model.Message{Role: "user", Content: cfg.Goal})
+		out.Final = hit.DirectReply
+		out.StopReason = "direct_reply"
+		out.Latency = time.Since(start)
+		_ = finish(tw, sess, out)
+		return out, nil
+	}
+	sess.Add(model.Message{Role: "user", Content: cfg.Goal})
 
 	for step := 1; step <= cfg.MaxSteps; step++ {
 		if err := ctx.Err(); err != nil {
@@ -404,6 +415,29 @@ func finish(tw *trace.Writer, sess *session.Session, out *Result) error {
 		Step:       out.Steps,
 	})
 	return sess.Save()
+}
+
+func applyContextInject(cfg Config, sess *session.Session, tw *trace.Writer) *inject.Hit {
+	if cfg.ContextInject == nil {
+		return nil
+	}
+	hit := cfg.ContextInject.Match(cfg.Goal)
+	if hit == nil {
+		return nil
+	}
+	_ = tw.Log(trace.Event{
+		Type:    "context_inject",
+		RunID:   cfg.RunID,
+		Name:    hit.RuleID,
+		Content: hit.DirectReply,
+	})
+	if hit.DirectReply != "" {
+		return hit
+	}
+	for _, m := range hit.Messages {
+		sess.Add(m)
+	}
+	return nil
 }
 
 func systemPrompt() string {

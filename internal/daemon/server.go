@@ -18,6 +18,7 @@ import (
 
 	"github.com/YaoLang/agentloop/internal/agent"
 	"github.com/YaoLang/agentloop/internal/auth"
+	"github.com/YaoLang/agentloop/internal/inject"
 	"github.com/YaoLang/agentloop/internal/memory"
 	"github.com/YaoLang/agentloop/internal/model"
 	"github.com/YaoLang/agentloop/internal/tools"
@@ -386,6 +387,8 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 
 var httpCatalogLogged sync.Map // tenant id → logged invalid catalog
 
+var contextCatalogLogged sync.Map // tenant id → logged invalid catalog
+
 func (s *Server) attachHTTPCatalog(opt *tools.Options, tenantID string) {
 	path := s.store.HTTPCatalogPath(tenantID)
 	cat, err := tools.LoadHTTPCatalog(path)
@@ -401,6 +404,21 @@ func (s *Server) attachHTTPCatalog(opt *tools.Options, tenantID string) {
 	if cat != nil && len(cat.Endpoints) > 0 {
 		opt.HTTP = cat
 	}
+}
+
+func (s *Server) loadContextCatalog(tenantID string) *inject.Catalog {
+	path := s.store.ContextCatalogPath(tenantID)
+	cat, err := inject.LoadCatalog(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if _, loaded := contextCatalogLogged.LoadOrStore(tenantID, true); !loaded {
+			log.Printf("agentloopd: tenant=%s context catalog: %v (context inject disabled)", tenantID, err)
+		}
+		return nil
+	}
+	return cat
 }
 
 func (s *Server) executeRun(rec RunRecord, p auth.Principal) {
@@ -469,14 +487,15 @@ func (s *Server) executeRun(rec RunRecord, p auth.Principal) {
 		},
 	})
 	res, err := agent.Run(ctx, agent.Config{
-		Workspace:   ws,
-		Goal:        rec.Goal,
-		Model:       m,
-		Registry:    reg,
-		Memory:      mem,
-		Timeout:     s.cfg.RunTimeout,
-		ToolTimeout: s.cfg.ToolTimeout,
-		RunID:       rec.ID,
+		Workspace:     ws,
+		Goal:          rec.Goal,
+		Model:         m,
+		Registry:      reg,
+		Memory:        mem,
+		Timeout:       s.cfg.RunTimeout,
+		ToolTimeout:   s.cfg.ToolTimeout,
+		RunID:         rec.ID,
+		ContextInject: s.loadContextCatalog(rec.TenantID),
 	})
 	if err != nil && res == nil {
 		rec.Status = statusFailed

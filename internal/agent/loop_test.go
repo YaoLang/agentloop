@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YaoLang/agentloop/internal/inject"
 	"github.com/YaoLang/agentloop/internal/model"
 	"github.com/YaoLang/agentloop/internal/tools"
 )
@@ -285,4 +286,98 @@ func TestLoopToolPanicContinues(t *testing.T) {
 	if len(res.ToolLog) == 0 || !strings.Contains(res.ToolLog[0].Result, "error:panic:") {
 		t.Fatalf("expected panic observation, log=%+v", res.ToolLog)
 	}
+}
+
+func TestLoopContextInjectDirectReply(t *testing.T) {
+	ws := t.TempDir()
+	cat := &inject.Catalog{
+		Rules: []inject.Rule{{
+			ID:          "ping",
+			Match:       inject.Match{GoalPrefix: "ping"},
+			DirectReply: "pong",
+		}},
+	}
+	if err := cat.Compile(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Run(context.Background(), Config{
+		Workspace:     ws,
+		Goal:          "ping health",
+		Model:         &mustNotCallModel{t: t},
+		ContextInject: cat,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StopReason != "direct_reply" || res.Final != "pong" {
+		t.Fatalf("stop=%s final=%q", res.StopReason, res.Final)
+	}
+	if res.Steps != 0 {
+		t.Fatalf("steps=%d want 0", res.Steps)
+	}
+}
+
+func TestLoopContextInjectMessages(t *testing.T) {
+	ws := t.TempDir()
+	cat := &inject.Catalog{
+		Rules: []inject.Rule{{
+			ID:    "hours",
+			Match: inject.Match{GoalContains: []string{"hours"}},
+			Messages: []model.Message{
+				{Role: "user", Content: "demo question"},
+				{Role: "assistant", Content: "demo answer"},
+			},
+		}},
+	}
+	if err := cat.Compile(); err != nil {
+		t.Fatal(err)
+	}
+	probe := &messageProbe{}
+	res, err := Run(context.Background(), Config{
+		Workspace:     ws,
+		Goal:          "store hours?",
+		Model:         probe,
+		ContextInject: cat,
+		MaxSteps:      2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !probe.sawDemo {
+		t.Fatal("injected messages missing from first Complete request")
+	}
+	if res.StopReason != "completed" || res.Final != "done" {
+		t.Fatalf("stop=%s final=%q", res.StopReason, res.Final)
+	}
+}
+
+type mustNotCallModel struct {
+	t *testing.T
+}
+
+func (m *mustNotCallModel) Name() string { return "must-not-call" }
+
+func (m *mustNotCallModel) Complete(_ context.Context, _ model.CompleteRequest) (model.CompleteResponse, error) {
+	m.t.Fatal("model.Complete should not run for direct_reply")
+	return model.CompleteResponse{}, nil
+}
+
+type messageProbe struct {
+	sawDemo bool
+}
+
+func (m *messageProbe) Name() string { return "probe" }
+
+func (m *messageProbe) Complete(_ context.Context, req model.CompleteRequest) (model.CompleteResponse, error) {
+	for i, msg := range req.Messages {
+		if msg.Role == "user" && msg.Content == "demo question" {
+			m.sawDemo = true
+		}
+		if i == len(req.Messages)-1 && msg.Role == "user" && msg.Content != "store hours?" {
+			return model.CompleteResponse{}, fmt.Errorf("last user message should be goal")
+		}
+	}
+	return model.CompleteResponse{
+		Message: model.Message{Role: "assistant", Content: "done"},
+	}, nil
 }

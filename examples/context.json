@@ -1,0 +1,17 @@
+{
+  "rules": [
+    {
+      "id": "store_hours",
+      "match": {"goal_contains": ["营业时间", "opening hours"]},
+      "messages": [
+        {"role": "user", "content": "你们几点开门？"},
+        {"role": "assistant", "content": "我们周一至周五 9:00-18:00 营业，周末 10:00-16:00。"}
+      ]
+    },
+    {
+      "id": "health_ping",
+      "match": {"goal_prefix": "ping"},
+      "direct_reply": "pong"
+    }
+  ]
+}
